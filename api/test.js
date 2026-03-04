@@ -44,7 +44,7 @@ const TEST_BACKORDERS = `
   }
 `;
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   const token = process.env.SHIPHERO_API_TOKEN;
 
   // Check token exists
