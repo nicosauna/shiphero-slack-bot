@@ -1,0 +1,13 @@
+{
+  "name": "shiphero-slack-bot",
+  "version": "1.0.0",
+  "description": "ShipHero Slack Bot on Vercel",
+  "dependencies": {
+    "@slack/bolt": "^3.17.0",
+    "@slack/web-api": "^7.0.0",
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
