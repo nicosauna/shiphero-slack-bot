@@ -1,117 +1,249 @@
-const shiphero = require("../lib/shiphero");
-const fmt = require("../lib/formatters");
-const { verifySlackSignature } = require("../lib/verify");
+const axios = require("axios");
+const cache = require("./cache");
 
-module.exports = async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+const API_URL = "https://public-api.shiphero.com/graphql";
+const REFRESH_URL = "https://public-api.shiphero.com/auth/refresh";
 
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const rawBody = Buffer.concat(chunks).toString("utf8");
+let cachedToken = null;
 
-  if (!verifySlackSignature(req, rawBody)) {
-    return res.status(401).send("Unauthorized");
-  }
+async function getToken() {
+  if (cachedToken) return cachedToken;
+  cachedToken = process.env.SHIPHERO_API_TOKEN;
+  if (!cachedToken) throw new Error("SHIPHERO_API_TOKEN is not set in Vercel environment variables.");
+  return cachedToken;
+}
 
-  const params = new URLSearchParams(rawBody);
-  const command = params.get("command");
-  const text = (params.get("text") || "").trim();
-
-  async function getCacheNote() {
-    try {
-      const lastRefresh = await shiphero.getLastRefresh();
-      if (!lastRefresh) return "_Fresh from ShipHero_";
-      const mins = Math.round((Date.now() - new Date(lastRefresh).getTime()) / 60000);
-      return `_Cached · updated ${mins < 1 ? "just now" : `${mins}m ago`} · \`/refresh-cache\` to force update_`;
-    } catch {
-      return "";
-    }
-  }
-
-  function addCacheNote(result, note) {
-    if (note && result.blocks) {
-      result.blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: note }] });
-    }
-    return result;
-  }
-
+async function runQuery(gql, variables = {}, retry = true) {
+  const token = await getToken();
   try {
-    let result;
-
-    switch (command) {
-      case "/backorders": {
-        const data = await shiphero.getAllBackorders();
-        const note = await getCacheNote();
-        result = addCacheNote(fmt.formatAllBackorders(data), note);
-        break;
+    const response = await axios.post(
+      API_URL,
+      { query: gql, variables },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        timeout: 25000,
       }
-
-      case "/backorder-sku":
-        if (!text) {
-          result = { response_type: "ephemeral", text: "⚠️ Please provide a SKU. Usage: `/backorder-sku SKU-123`" };
-        } else {
-          const data = await shiphero.getBackorderBySku(text);
-          result = fmt.formatBackorderBySku(data, text);
+    );
+    if (response.data.errors) {
+      const err = response.data.errors[0];
+      if (err.code === 30) throw new Error(`Rate limit hit. ${err.time_remaining || "Wait a few seconds"} and try again.`);
+      throw new Error(response.data.errors.map((e) => e.message).join(", "));
+    }
+    return response.data.data;
+  } catch (err) {
+    if (err.response?.status === 401 && retry) {
+      try {
+        const refreshToken = process.env.SHIPHERO_REFRESH_TOKEN;
+        if (refreshToken) {
+          const r = await axios.post(REFRESH_URL, { refresh_token: refreshToken }, { headers: { "Content-Type": "application/json" }, timeout: 10000 });
+          cachedToken = r.data.access_token;
+          return runQuery(gql, variables, false);
         }
-        break;
-
-      case "/inventory": {
-        const data = await shiphero.getAllInventory();
-        const note = await getCacheNote();
-        result = addCacheNote(fmt.formatAllInventory(data), note);
-        break;
+      } catch (refreshErr) {
+        throw new Error("Token expired and refresh failed. Please update SHIPHERO_API_TOKEN in Vercel.");
       }
+    }
+    throw err;
+  }
+}
 
-      case "/inventory-sku":
-        if (!text) {
-          result = { response_type: "ephemeral", text: "⚠️ Please provide a SKU. Usage: `/inventory-sku SKU-123`" };
-        } else {
-          const data = await shiphero.getInventoryBySku(text);
-          result = fmt.formatInventoryBySku(data);
+// ─── Products Query ───────────────────────────────────────────────────────────
+
+const GET_PRODUCTS = `
+  query GetProducts($cursor: String) {
+    products {
+      request_id
+      complexity
+      data(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            sku
+            name
+            warehouse_products {
+              on_hand
+              available
+              allocated
+              backorder
+              warehouse { identifier }
+            }
+          }
         }
-        break;
-
-      case "/low-stock": {
-        const threshold = parseInt(text) || 10;
-        const data = await shiphero.getLowStockItems(threshold);
-        const note = await getCacheNote();
-        result = addCacheNote(fmt.formatLowStock(data, threshold), note);
-        break;
       }
+    }
+  }
+`;
 
-      case "/refresh-cache": {
-        await shiphero.getAllInventory(true);
-        result = {
-          response_type: "in_channel",
-          blocks: [
-            {
-              type: "section",
-              text: { type: "mrkdwn", text: "✅ *Cache refreshed!* ShipHero data is now up to date." },
-            },
-          ],
-        };
-        break;
+const GET_PRODUCT_BY_SKU = `
+  query GetProductBySku($sku: String!) {
+    product(sku: $sku) {
+      request_id
+      complexity
+      data {
+        sku
+        name
+        warehouse_products {
+          on_hand
+          available
+          allocated
+          backorder
+          warehouse { identifier }
+        }
       }
+    }
+  }
+`;
 
-      case "/shiphero-help":
-        result = fmt.formatHelp();
-        break;
+// ─── Fetch all products from ShipHero (live, no cache) ───────────────────────
 
-      default:
-        result = { response_type: "ephemeral", text: `Unknown command: ${command}. Try \`/shiphero-help\`.` };
+async function fetchFromShipHero() {
+  const results = [];
+  let cursor = null;
+  let hasNextPage = true;
+  let pages = 0;
+  const MAX_PAGES = 5; // 100 per page × 5 = 500 max, covers 316 SKUs in 4 calls
+
+  while (hasNextPage && pages < MAX_PAGES) {
+    const result = await runQuery(GET_PRODUCTS, { cursor });
+    const { edges, pageInfo } = result.products.data;
+    pages++;
+
+    for (const { node: product } of edges) {
+      // Skip barcode/UPC SKUs (numeric-only, 10+ digits)
+      if (/^\d{10,}$/.test(product.sku)) continue;
+
+      const warehouses = (product.warehouse_products || []).map((w) => ({
+        name: w.warehouse?.identifier || "Unknown",
+        on_hand: w.on_hand || 0,
+        available: w.available || 0,
+        allocated: w.allocated || 0,
+        backorder: w.backorder || 0,
+      }));
+
+      const totals = warehouses.reduce(
+        (acc, w) => ({
+          on_hand: acc.on_hand + w.on_hand,
+          available: acc.available + w.available,
+          allocated: acc.allocated + w.allocated,
+          backorder: acc.backorder + w.backorder,
+        }),
+        { on_hand: 0, available: 0, allocated: 0, backorder: 0 }
+      );
+
+      results.push({ sku: product.sku, name: product.name, warehouses, ...totals });
     }
 
-    return res.status(200).json(result);
-
-  } catch (err) {
-    console.error("Slack handler error:", err.message);
-    return res.status(200).json({
-      response_type: "ephemeral",
-      text: `❌ *Error*: ${err.message}`,
-    });
+    hasNextPage = pageInfo.hasNextPage;
+    cursor = pageInfo.endCursor;
   }
-};
 
-module.exports.config = {
-  api: { bodyParser: false },
+  return { items: results, truncated: hasNextPage };
+}
+
+// ─── Get all products — from cache or live ────────────────────────────────────
+
+async function getAllProducts(forceRefresh = false) {
+  if (!forceRefresh) {
+    const cached = await cache.getCachedProducts();
+    if (cached) {
+      console.log("Returning cached products");
+      return cached;
+    }
+  }
+
+  console.log("Fetching fresh data from ShipHero...");
+  const data = await fetchFromShipHero();
+  await cache.setCachedProducts(data);
+  return data;
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+async function getAllBackorders(forceRefresh = false) {
+  const { items, truncated } = await getAllProducts(forceRefresh);
+  return {
+    items: items.filter((p) => p.backorder > 0).sort((a, b) => b.backorder - a.backorder),
+    truncated,
+  };
+}
+
+async function getBackorderBySku(sku) {
+  // Always fetch SKU lookups live for accuracy
+  const result = await runQuery(GET_PRODUCT_BY_SKU, { sku });
+  const product = result.product.data;
+  if (!product) return [];
+
+  const warehouses = (product.warehouse_products || []).map((w) => ({
+    name: w.warehouse?.identifier || "Unknown",
+    on_hand: w.on_hand || 0,
+    available: w.available || 0,
+    allocated: w.allocated || 0,
+    backorder: w.backorder || 0,
+  }));
+
+  const totals = warehouses.reduce(
+    (acc, w) => ({
+      on_hand: acc.on_hand + w.on_hand,
+      available: acc.available + w.available,
+      allocated: acc.allocated + w.allocated,
+      backorder: acc.backorder + w.backorder,
+    }),
+    { on_hand: 0, available: 0, allocated: 0, backorder: 0 }
+  );
+
+  if (totals.backorder === 0) return [];
+  return [{ sku: product.sku, name: product.name, warehouses, ...totals }];
+}
+
+async function getAllInventory(forceRefresh = false) {
+  return getAllProducts(forceRefresh);
+}
+
+async function getInventoryBySku(sku) {
+  const result = await runQuery(GET_PRODUCT_BY_SKU, { sku });
+  const product = result.product.data;
+  if (!product) return null;
+
+  const warehouses = (product.warehouse_products || []).map((w) => ({
+    name: w.warehouse?.identifier || "Unknown",
+    on_hand: w.on_hand || 0,
+    available: w.available || 0,
+    allocated: w.allocated || 0,
+    backorder: w.backorder || 0,
+  }));
+
+  const totals = warehouses.reduce(
+    (acc, w) => ({
+      on_hand: acc.on_hand + w.on_hand,
+      available: acc.available + w.available,
+      allocated: acc.allocated + w.allocated,
+      backorder: acc.backorder + w.backorder,
+    }),
+    { on_hand: 0, available: 0, allocated: 0, backorder: 0 }
+  );
+
+  return { sku: product.sku, name: product.name, warehouses, ...totals };
+}
+
+async function getLowStockItems(threshold = 10, forceRefresh = false) {
+  const { items, truncated } = await getAllProducts(forceRefresh);
+  return {
+    items: items
+      .filter((p) => p.available <= threshold && p.available >= 0)
+      .sort((a, b) => a.available - b.available),
+    truncated,
+  };
+}
+
+module.exports = {
+  getAllBackorders,
+  getBackorderBySku,
+  getAllInventory,
+  getInventoryBySku,
+  getLowStockItems,
+  getLastRefresh: cache.getLastRefresh,
+  clearCache: cache.clearCache,
 };
